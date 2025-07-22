@@ -38,3 +38,4 @@ message(STATUS "Available MLIR dialect libraries: ${dialect_libs}")
 message(STATUS "Available MLIR conversion libraries: ${conversion_libs}")
 
 add_subdirectory(src)
+add_subdirectory(Tools)

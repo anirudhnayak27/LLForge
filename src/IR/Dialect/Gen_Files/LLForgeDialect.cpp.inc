@@ -7,19 +7,19 @@
 |*                                                                            *|
 \*===----------------------------------------------------------------------===*/
 
-MLIR_DEFINE_EXPLICIT_TYPE_ID(::mlir::LLFORGE::llforgedialect)
+MLIR_DEFINE_EXPLICIT_TYPE_ID(::mlir::LLFORGE::LLForgeDialect)
 namespace mlir {
 namespace LLFORGE {
 
-llforgedialect::llforgedialect(::mlir::MLIRContext *context)
-    : ::mlir::Dialect(getDialectNamespace(), context, ::mlir::TypeID::get<llforgedialect>())
+LLForgeDialect::LLForgeDialect(::mlir::MLIRContext *context)
+    : ::mlir::Dialect(getDialectNamespace(), context, ::mlir::TypeID::get<LLForgeDialect>())
     
      {
   
   initialize();
 }
 
-llforgedialect::~llforgedialect() = default;
+LLForgeDialect::~LLForgeDialect() = default;
 
 } // namespace LLFORGE
 } // namespace mlir

@@ -1,16 +1,20 @@
 #include "LLForgeDialect.h"
 
-using namespace mlir;
 using namespace mlir::LLFORGE;
 
-MLIR_DEFINE_EXPLICIT_TYPE_ID(mlir::LLFORGE::llforgedialect);
+MLIR_DEFINE_EXPLICIT_TYPE_ID(mlir::LLFORGE::LLForgeDialect);
 
-void llforgedialect::initialize() { 
-    addOperations<LLForgeWriteOp>();
+LLForgeDialect::~LLForgeDialect() = default;
+
+void LLForgeDialect::initialize() {
+  addOperations<
+#define GET_OP_LIST
+#include "Gen_Files/LLForgeOps.cpp.inc"
+      >();
 }
 
-llforgedialect::llforgedialect(MLIRContext *ctx)
-    : Dialect(getDialectNamespace(), ctx, TypeID::get<llforgedialect>()) {
+LLForgeDialect::LLForgeDialect(MLIRContext *ctx)
+    : Dialect(getDialectNamespace(), ctx, TypeID::get<LLForgeDialect>()) {
   initialize();
 }
 
