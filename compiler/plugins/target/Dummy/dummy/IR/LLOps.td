@@ -43,10 +43,10 @@ def LL_ConvOp : LL_Op<"conv", [Pure]> {
 
     let assemblyFormat = [{
         $input `,` $filter `,` $output
-        `strides` `=` $strides
-        `dilations` `=` $dilations
-        `pad_low` `=` $pad_low
-        `pad_high` `=` $pad_high
+        (`strides` `=` $strides^)?
+        (`dilations` `=` $dilations^)?
+        (`pad_low` `=` $pad_low^)?
+        (`pad_high` `=` $pad_high^)?
         attr-dict `:` `(` type($input) `,` type($filter) `,` type($output) `)` `->` type($result)
     }];
 }
