@@ -13,8 +13,11 @@ def LL_Dialect : Dialect {
         Captures convolution data lowered from linalg.generic.
     }];
 
+    let useDefaultAttributePrinterParser = 1;
+
     let extraClassDeclaration = [{
         void initializeLLOps();
+        void initializeLLAttrs();
     }];
 }
 

@@ -9,6 +9,7 @@ iree_cc_library(
     DEPS
         iree::compiler::Dialect::HAL::Target
         iree::compiler::PluginAPI
+        iree::target::dummy::Encoding::ExternalModels
         iree::target::dummy::IR::LLDialect
         iree::target::dummy::Target
         iree::target::dummy::Transforms
@@ -23,6 +24,7 @@ iree_compiler_register_plugin(
         ::registration
 )
 
+add_subdirectory(Encoding)
 add_subdirectory(IR)
 add_subdirectory(Target)
 add_subdirectory(Transforms)

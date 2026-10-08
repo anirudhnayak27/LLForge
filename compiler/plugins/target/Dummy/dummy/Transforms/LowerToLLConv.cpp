@@ -19,6 +19,14 @@
 namespace mlir::iree_compiler::Dummy {
 namespace {
 
+// Attributes stamped on the tiled conv generic by #ll.encoding_resolver
+// (see dummy/Encoding/LLEncodingExternalModels.cpp).
+constexpr StringLiteral kTileSizesAttrName = "ll.tile_sizes";
+constexpr StringLiteral kStridesAttrName = "ll.strides";
+constexpr StringLiteral kPaddingAttrName = "ll.padding";
+constexpr StringLiteral kInputHwAttrName = "ll.input_hw";
+constexpr StringLiteral kInputCAttrName = "ll.input_c";
+
 SmallVector<int64_t> extractConvStrides(linalg::LinalgOp linalgOp) {
   if (auto dims = linalg::inferConvolutionDims(linalgOp);
       succeeded(dims) && !dims->strides.empty()) {
@@ -53,6 +61,8 @@ SmallVector<int64_t> extractConvPaddingHigh(Value input) {
 
 bool isConv2D(linalg::LinalgOp linalgOp) {
   if (linalgOp.getNumDpsInputs() < 2) return false;
+  // Data-tiled convs are handled by LowerTiledConvGenericToLLTiledConv.
+  if (linalgOp->hasAttr(kTileSizesAttrName)) return false;
 
   SmallVector<AffineMap> maps = linalgOp.getIndexingMapsArray();
   if (maps.size() < 3) return false;
@@ -102,6 +112,54 @@ class LowerLinalgGenericToLLConv
   }
 };
 
+/// Lowers the 10-D tiled conv generic produced by data tiling to
+/// ll.tiled_conv. The generic reads the packed activation off its operand list
+/// through a tensor.extract in the body; its operands are the packed filter
+/// (plus unused extra inputs) and the packed output.
+class LowerTiledConvGenericToLLTiledConv
+    : public OpRewritePattern<linalg::GenericOp> {
+ public:
+  using OpRewritePattern<linalg::GenericOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(linalg::GenericOp genericOp,
+                                PatternRewriter &rewriter) const override {
+    auto tileSizes =
+        genericOp->getAttrOfType<DenseI64ArrayAttr>(kTileSizesAttrName);
+    auto strides = genericOp->getAttrOfType<DenseI64ArrayAttr>(kStridesAttrName);
+    if (!tileSizes || !strides) {
+      return rewriter.notifyMatchFailure(genericOp, "not a tiled conv");
+    }
+    if (genericOp.getNumDpsInputs() < 1 || genericOp.getNumDpsInits() != 1) {
+      return rewriter.notifyMatchFailure(genericOp, "unexpected operands");
+    }
+
+    Value input;
+    genericOp.getBody()->walk([&](tensor::ExtractOp extractOp) {
+      Value tensor = extractOp.getTensor();
+      if (!genericOp.getRegion().isAncestor(tensor.getParentRegion())) {
+        input = tensor;
+      }
+    });
+    if (!input) {
+      return rewriter.notifyMatchFailure(genericOp,
+                                         "no packed activation read in body");
+    }
+
+    Value filter = genericOp.getDpsInputs()[0];
+    Value output = genericOp.getDpsInits()[0];
+    auto inputC = genericOp->getAttrOfType<IntegerAttr>(kInputCAttrName);
+    auto tiledConv = Dummy::LL::TiledConvOp::create(
+        rewriter, genericOp.getLoc(), output.getType(), input, filter, output, tileSizes,
+        strides, genericOp->getAttrOfType<DenseI64ArrayAttr>(kPaddingAttrName),
+        genericOp->getAttrOfType<DenseI64ArrayAttr>(kInputHwAttrName),
+        inputC);
+    LLVM_DEBUG(llvm::dbgs() << "Lowered tiled conv to ll.tiled_conv: "
+                            << tiledConv << "\n");
+    rewriter.replaceOp(genericOp, tiledConv.getResult());
+    return success();
+  }
+};
+
 struct DummyLowerToLLConvPass
     : public impl::DummyLowerToLLConvBase<DummyLowerToLLConvPass> {
   using DummyLowerToLLConvBase::DummyLowerToLLConvBase;
@@ -109,7 +167,8 @@ struct DummyLowerToLLConvPass
   void runOnOperation() override {
     MLIRContext *ctx = &getContext();
     RewritePatternSet patterns(ctx);
-    patterns.add<LowerLinalgGenericToLLConv>(ctx);
+    patterns.add<LowerLinalgGenericToLLConv, LowerTiledConvGenericToLLTiledConv>(
+        ctx);
     if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {
       signalPassFailure();
     }

@@ -1,0 +1,594 @@
+From 2e97463028ccfa1246033290c968e059d129cf30 Mon Sep 17 00:00:00 2001
+From: anirudh nayak <anirudh.nayak@sandlogic.com>
+Date: Thu, 8 Oct 2026 11:30:04 +0530
+Subject: [PATCH] [DispatchCreation] Add opt-in data tiling for 2D convolutions
+
+Adds `op_type = conv` encodings for 2D convolutions so a target's encoding
+resolver can data-tile them.
+
+- Encoding: CONV_LHS/CONV_RHS/CONV_RESULT operand indices and conv support
+  in SerializableAttr::getEncodingProperties.
+- AnnotateDataTilingHints: annotate convolutions (channel-mixing, two
+  output image dims) when --iree-dispatch-creation-data-tiling-convs is set.
+- SetEncoding: when a conv activation is a constant, symmetrically padded
+  tensor.pad, encode the unpadded source, drop the kernel offsets from the
+  activation map and record the padding and logical input sizes as
+  iree_encoding.conv_padding / conv_input_hw / conv_input_c. Inputs without
+  encodings (e.g. zero points) are now kept when cloning the op.
+- HoistEncodingOps / FuseEncodingOpsIntoDispatchRegions / FusionUtils: allow
+  constant tensor.pad in hoisted/fused encoding chains; do not sink
+  unset_encoding through transposing consumers.
+- DispatchCreation: --iree-dispatch-creation-disable-collapse-dimensions.
+- MaterializeEncodingPatterns: fail the match instead of crashing when the
+  resolver's lowerOp returns null.
+---
+ .../Common/MaterializeEncodingPatterns.cpp    |   4 +
+ .../Dialect/Encoding/IR/EncodingTypes.cpp     |  53 +++++
+ .../Dialect/Encoding/IR/EncodingTypes.h       |  14 ++
+ .../AnnotateDataTilingHints.cpp               |  38 +++-
+ .../FuseEncodingOpsIntoDispatchRegions.cpp    |   7 +-
+ .../compiler/DispatchCreation/FusionUtils.cpp |   3 +-
+ .../DispatchCreation/HoistEncodingOps.cpp     |  65 +++++++
+ .../iree/compiler/DispatchCreation/Passes.cpp |  12 +-
+ .../compiler/DispatchCreation/SetEncoding.cpp | 182 +++++++++++++++++-
+ 9 files changed, 365 insertions(+), 13 deletions(-)
+
+diff --git a/compiler/src/iree/compiler/Codegen/Common/MaterializeEncodingPatterns.cpp b/compiler/src/iree/compiler/Codegen/Common/MaterializeEncodingPatterns.cpp
+index 259af26..c287cdf 100644
+--- a/compiler/src/iree/compiler/Codegen/Common/MaterializeEncodingPatterns.cpp
++++ b/compiler/src/iree/compiler/Codegen/Common/MaterializeEncodingPatterns.cpp
+@@ -662,6 +662,10 @@ public:
+     }
+     Operation *newOp =
+         layoutAttr.lowerOp(rewriter, op, convertedResTypes, operands);
++    if (!newOp) {
++      return rewriter.notifyMatchFailure(
++          op, "unsupported operation for encoding materialization");
++    }
+     rewriter.replaceOp(op, newOp->getResults());
+     return success();
+   }
+diff --git a/compiler/src/iree/compiler/Dialect/Encoding/IR/EncodingTypes.cpp b/compiler/src/iree/compiler/Dialect/Encoding/IR/EncodingTypes.cpp
+index c1f7d7d..2b0b157 100644
+--- a/compiler/src/iree/compiler/Dialect/Encoding/IR/EncodingTypes.cpp
++++ b/compiler/src/iree/compiler/Dialect/Encoding/IR/EncodingTypes.cpp
+@@ -52,6 +52,28 @@ static Type getContractionInputTypeWithSignedness(OpBuilder &builder,
+   return elemType;
+ }
+ 
++/// Given a convolution LinalgOp and one of its OpOperands, return the element
++/// type, inferring signedness from the extension ops in the body.
++static Type getConvolutionInputTypeWithSignedness(OpBuilder &builder,
++                                                  linalg::LinalgOp linalgOp,
++                                                  OpOperand *operand) {
++  auto elemType = getElementTypeOrSelf(operand->get().getType());
++  Value blockArg = linalgOp.getMatchingBlockArgument(operand);
++  for (auto bodyCastOp : blockArg.getParentBlock()->getOps<arith::ExtUIOp>()) {
++    if (bodyCastOp->getOperand(0) == blockArg) {
++      return builder.getIntegerType(elemType.getIntOrFloatBitWidth(),
++                                    /*isSigned=*/false);
++    }
++  }
++  for (auto bodyCastOp : blockArg.getParentBlock()->getOps<arith::ExtSIOp>()) {
++    if (bodyCastOp->getOperand(0) == blockArg) {
++      return builder.getIntegerType(elemType.getIntOrFloatBitWidth(),
++                                    /*isSigned=*/true);
++    }
++  }
++  return elemType;
++}
++
+ /// Extract dynamic dimension values for a linalg operation in loop order.
+ /// Returns values only for dimensions that are dynamic.
+ static SmallVector<Value> getDynamicLoopDims(OpBuilder &builder,
+@@ -146,6 +168,37 @@ SerializableAttr::getEncodingProperties(Operation *op) {
+     return props;
+   }
+ 
++  // Return encoding properties for 2D convolutions. Only ops that mix
++  // channels (both input and output channel dims) are handled; pooling and
++  // depthwise-like ops have no filter to encode and are rejected.
++  if (linalg::isaConvolutionOpInterface(linalgOp)) {
++    FailureOr<linalg::ConvolutionDimensions> convDims =
++        linalg::inferConvolutionDims(linalgOp);
++    if (failed(convDims) || convDims->outputImage.size() != 2 ||
++        convDims->inputChannel.empty() || convDims->outputChannel.empty() ||
++        linalgOp.getNumDpsInputs() < 2) {
++      return failure();
++    }
++
++    Type lhsElemType = getConvolutionInputTypeWithSignedness(
++        builder, linalgOp, linalgOp.getDpsInputOperand(0));
++    Type rhsElemType = getConvolutionInputTypeWithSignedness(
++        builder, linalgOp, linalgOp.getDpsInputOperand(1));
++    Type outElemType = getConvolutionInputTypeWithSignedness(
++        builder, linalgOp, linalgOp.getDpsInitOperand(0));
++    if (!lhsElemType || !rhsElemType || !outElemType) {
++      return failure();
++    }
++
++    elemTypes = {lhsElemType, rhsElemType, outElemType};
++    opType = EncodingOpType::conv;
++
++    props.operands.push_back(addEncoding(CONV_LHS));
++    props.operands.push_back(addEncoding(CONV_RHS));
++    props.inits.push_back(addEncoding(CONV_RESULT));
++    return props;
++  }
++
+   // Return failure for unsupported operations.
+   return failure();
+ }
+diff --git a/compiler/src/iree/compiler/Dialect/Encoding/IR/EncodingTypes.h b/compiler/src/iree/compiler/Dialect/Encoding/IR/EncodingTypes.h
+index 12d45bf..c642314 100644
+--- a/compiler/src/iree/compiler/Dialect/Encoding/IR/EncodingTypes.h
++++ b/compiler/src/iree/compiler/Dialect/Encoding/IR/EncodingTypes.h
+@@ -33,6 +33,20 @@ const int64_t SCALED_MATMUL_LHS_SCALES = 2;
+ const int64_t SCALED_MATMUL_RHS_SCALES = 3;
+ const int64_t SCALED_MATMUL_RESULT = 4;
+ 
++const int64_t CONV_LHS = 0;
++const int64_t CONV_RHS = 1;
++const int64_t CONV_RESULT = 2;
++
++/// Discardable attributes set by SetEncoding on a convolution whose padded
++/// activation was encoded without its padding:
++///   - kConvPaddingAttrName: symmetric spatial padding [padH, padW] that the
++///     target has to apply as a halo.
++///   - kConvInputHWAttrName: unpadded activation spatial sizes [H, W].
++///   - kConvInputCAttrName:  unpadded activation channel count.
++static constexpr char kConvPaddingAttrName[] = "iree_encoding.conv_padding";
++static constexpr char kConvInputHWAttrName[] = "iree_encoding.conv_input_hw";
++static constexpr char kConvInputCAttrName[] = "iree_encoding.conv_input_c";
++
+ /// Convert operand index to strings for printing
+ std::string stringifyOperandIndex(IntegerAttr);
+ 
+diff --git a/compiler/src/iree/compiler/DispatchCreation/AnnotateDataTilingHints.cpp b/compiler/src/iree/compiler/DispatchCreation/AnnotateDataTilingHints.cpp
+index f3c12ce..e70c6d5 100644
+--- a/compiler/src/iree/compiler/DispatchCreation/AnnotateDataTilingHints.cpp
++++ b/compiler/src/iree/compiler/DispatchCreation/AnnotateDataTilingHints.cpp
+@@ -23,6 +23,15 @@ namespace mlir::iree_compiler::DispatchCreation {
+ #define GEN_PASS_DEF_ANNOTATEDATATILINGHINTSPASS
+ #include "iree/compiler/DispatchCreation/Passes.h.inc"
+ 
++// Convolution data tiling is opt-in: the target's encoding resolver has to
++// know how to materialize `op_type = conv` encodings.
++static llvm::cl::opt<bool> clDataTilingConvs(
++    "iree-dispatch-creation-data-tiling-convs",
++    llvm::cl::desc("Also annotate 2D convolutions with data-tiling hints. "
++                   "Requires a target whose encoding resolver supports "
++                   "convolution encodings."),
++    llvm::cl::init(false));
++
+ namespace {
+ struct AnnotateDataTilingHintsPass final
+     : impl::AnnotateDataTilingHintsPassBase<AnnotateDataTilingHintsPass> {
+@@ -165,6 +174,29 @@ static bool isSupportedScaledContractionOp(linalg::LinalgOp linalgOp) {
+   return true;
+ }
+ 
++/// Returns true if `linalgOp` is a convolution that can be data-tiled:
++///   1) `linalgOp` meets the pre-conditions for data tiling defined in
++///      `dataTilablePreCondition`.
++///   2) `linalgOp` has convolution indexing maps with two output image dims
++///      and filter loops.
++///   3) `linalgOp` mixes channels (has both input and output channel dims),
++///      which excludes pooling and depthwise convolutions.
++static bool isSupportedConvolutionOp(linalg::LinalgOp linalgOp) {
++  if (!dataTilablePreCondition(linalgOp)) {
++    return false;
++  }
++  if (!linalg::isaConvolutionOpInterface(linalgOp)) {
++    return false;
++  }
++  FailureOr<linalg::ConvolutionDimensions> convDims =
++      linalg::inferConvolutionDims(linalgOp);
++  if (failed(convDims)) {
++    return false;
++  }
++  return convDims->outputImage.size() == 2 && !convDims->filterLoop.empty() &&
++         !convDims->inputChannel.empty() && !convDims->outputChannel.empty();
++}
++
+ void AnnotateDataTilingHintsPass::runOnOperation() {
+   FunctionOpInterface funcOp = getOperation();
+   SmallVector<Operation *> candidates;
+@@ -173,8 +205,10 @@ void AnnotateDataTilingHintsPass::runOnOperation() {
+       return WalkResult::interrupt();
+     }
+     auto linalgOp = dyn_cast<linalg::LinalgOp>(op);
+-    if (linalgOp && (isSupportedContractionOp(linalgOp) ||
+-                     isSupportedScaledContractionOp(linalgOp))) {
++    if (linalgOp &&
++        (isSupportedContractionOp(linalgOp) ||
++         isSupportedScaledContractionOp(linalgOp) ||
++         (clDataTilingConvs && isSupportedConvolutionOp(linalgOp)))) {
+       candidates.push_back(op);
+       return WalkResult::advance();
+     }
+diff --git a/compiler/src/iree/compiler/DispatchCreation/FuseEncodingOpsIntoDispatchRegions.cpp b/compiler/src/iree/compiler/DispatchCreation/FuseEncodingOpsIntoDispatchRegions.cpp
+index 9443083..4f78763 100644
+--- a/compiler/src/iree/compiler/DispatchCreation/FuseEncodingOpsIntoDispatchRegions.cpp
++++ b/compiler/src/iree/compiler/DispatchCreation/FuseEncodingOpsIntoDispatchRegions.cpp
+@@ -50,9 +50,10 @@ static bool isFusableWithSetEncoding(Operation *target) {
+       continue;
+     }
+     if (!isa<tensor::CollapseShapeOp, tensor::ExpandShapeOp, tensor::EmptyOp,
+-             tensor::ExtractSliceOp, IREE::Encoding::SetEncodingOp,
+-             IREE::Encoding::UnsetEncodingOp, linalg::LinalgOp,
+-             IREE::LinalgExt::AttentionOp, IREE::LinalgExt::GatherOp>(op)) {
++             tensor::ExtractSliceOp, tensor::PadOp,
++             IREE::Encoding::SetEncodingOp, IREE::Encoding::UnsetEncodingOp,
++             linalg::LinalgOp, IREE::LinalgExt::AttentionOp,
++             IREE::LinalgExt::GatherOp>(op)) {
+       return false;
+     }
+   }
+diff --git a/compiler/src/iree/compiler/DispatchCreation/FusionUtils.cpp b/compiler/src/iree/compiler/DispatchCreation/FusionUtils.cpp
+index 7f22620..63a52df 100644
+--- a/compiler/src/iree/compiler/DispatchCreation/FusionUtils.cpp
++++ b/compiler/src/iree/compiler/DispatchCreation/FusionUtils.cpp
+@@ -147,7 +147,8 @@ getProducerDispatchValueAndOpChain(Value operand, bool enableAggressiveFusion) {
+     // If it is an operation that we want to look past, add it to the chain
+     // and update the `producerValue`.
+     Operation *currOperation = producerValue.getOwner();
+-    if (isa<tensor::CollapseShapeOp, tensor::ExpandShapeOp>(currOperation)) {
++    if (isa<tensor::CollapseShapeOp, tensor::ExpandShapeOp, tensor::PadOp>(
++            currOperation)) {
+       opChain.push_back(currOperation);
+       producerValue = dyn_cast<OpResult>(currOperation->getOperand(0));
+       continue;
+diff --git a/compiler/src/iree/compiler/DispatchCreation/HoistEncodingOps.cpp b/compiler/src/iree/compiler/DispatchCreation/HoistEncodingOps.cpp
+index d225a32..9941e22 100644
+--- a/compiler/src/iree/compiler/DispatchCreation/HoistEncodingOps.cpp
++++ b/compiler/src/iree/compiler/DispatchCreation/HoistEncodingOps.cpp
+@@ -18,6 +18,7 @@
+ #include "iree/compiler/Dialect/LinalgExt/Utils/Utils.h"
+ #include "iree/compiler/Dialect/Util/Analysis/Constant/ConstExpr.h"
+ #include "iree/compiler/Dialect/Util/IR/UtilOps.h"
++#include "iree/compiler/DispatchCreation/FusionUtils.h"
+ #include "iree/compiler/DispatchCreation/Passes.h"
+ #include "llvm/ADT/STLExtras.h"
+ #include "llvm/Support/Debug.h"
+@@ -169,6 +170,17 @@ static bool isHoistableOp(Operation *op) {
+     return IREE::Flow::isOffsetSizeAndStrideMappableToFlow(offsets, sizes,
+                                                            strides, srcShape);
+   }
++  // A constant-padded tensor.pad (conv spatial halo) is hoistable: hoisting it
++  // out of the consumer dispatch together with its set_encoding lets
++  // FuseEncodingOpsIntoDispatchRegions relocate pad+set_encoding into the
++  // producer dispatch, so the cross-dispatch boundary tensor stays tiled.
++  // Only hoist when the padding value is a constant — otherwise relocating the
++  // pad would capture a non-dominating SSA value across dispatch boundaries.
++  if (auto padOp = dyn_cast<tensor::PadOp>(op)) {
++    Value padValue = padOp.getConstantPaddingValue();
++    return padValue && padValue.getDefiningOp() &&
++           padValue.getDefiningOp()->hasTrait<OpTrait::ConstantLike>();
++  }
+   // ConstExprHoistingPolicy has an assumption that any root op is not hoistable
+   // because they are already hoisted. This is not the case when the parent op
+   // is a constant-like op, so we have a special rule here.
+@@ -230,6 +242,25 @@ struct SinkUnsetEncodingOp : OpRewritePattern<IREE::Encoding::UnsetEncodingOp> {
+           encodingOp, "expected that both operations are inside dispatch");
+     }
+ 
++    // Do not sink the encoding through a layout-permuting (transpose) consumer.
++    // Propagating an encoding through such an op composes the permutation into
++    // the encoding's user_indexing_maps as a [base, perm] map list, which conv
++    // encoding resolvers cannot materialize, and which also yields a
++    // multi-output generic with mismatched output maps that the
++    // generic-lowering helper rejects. Leaving the relayout transpose outside
++    // the encoding keeps it on the standard standalone-transpose path.
++    // Non-permuting consumers (e.g. dequant/elementwise with identity maps) are
++    // unaffected.
++    if (auto consumerLinalg = dyn_cast<linalg::LinalgOp>(consumer)) {
++      for (AffineMap map : consumerLinalg.getIndexingMapsArray()) {
++        if (map.isPermutation() && !map.isIdentity()) {
++          return rewriter.notifyMatchFailure(
++              consumer, "consumer has a non-identity permutation (transpose) "
++                        "indexing map");
++        }
++      }
++    }
++
+     auto propagationAttrInterface =
+         dyn_cast<IREE::Encoding::EncodingPropagationAttrInterface>(
+             encodingOp.getSourceType().getEncoding());
+@@ -343,6 +374,21 @@ void HoistEncodingOpsPass::runOnOperation() {
+         }
+       }
+     }
++    // Guard: a hoisted tensor.pad must be fusable into a producer dispatch by
++    // FuseEncodingOpsIntoDispatchRegions; otherwise it is left stranded outside
++    // any dispatch and fails legalization in ConvertEncodingToFlow. Skip
++    // hoisting when the padded value has no producer dispatch (e.g. the input
++    // comes from a branch/concat rather than a single conv dispatch).
++    if (isHoistable) {
++      for (Operation *op : opsWithinDispatch) {
++        auto padOp = dyn_cast<tensor::PadOp>(op);
++        if (padOp && !getProducerDispatchValueAndOpChain(padOp.getSource())) {
++          isHoistable = false;
++          break;
++        }
++      }
++    }
++
+     if (isHoistable) {
+       candidates.push_back(llvm::to_vector(llvm::reverse(opsWithinDispatch)));
+       return;
+@@ -367,6 +413,25 @@ void HoistEncodingOpsPass::runOnOperation() {
+   for (ArrayRef<Operation *> hoistableOps : candidates) {
+     LDBG() << "Hoisting the ops for " << *hoistableOps.back();
+     for (Operation *op : hoistableOps) {
++      // A tensor.pad's padding value is captured by its body region. If that
++      // constant lives inside the dispatch (sunk in by CloneProducers),
++      // hoisting the pad out would leave the use dangling. Re-materialize the
++      // constant inside the pad's own region so it travels with the pad.
++      if (auto padOp = dyn_cast<tensor::PadOp>(op)) {
++        Value padValue = padOp.getConstantPaddingValue();
++        if (Operation *cstOp = padValue ? padValue.getDefiningOp() : nullptr) {
++          Block &padBlock = padOp.getRegion().front();
++          auto yieldOp = cast<tensor::YieldOp>(padBlock.getTerminator());
++          if (yieldOp.getValue() == padValue &&
++              padValue.getParentBlock() != &padBlock) {
++            rewriter.setInsertionPoint(yieldOp);
++            Operation *clonedCst = rewriter.clone(*cstOp);
++            rewriter.modifyOpInPlace(yieldOp, [&]() {
++              yieldOp.getValueMutable().assign(clonedCst->getResult(0));
++            });
++          }
++        }
++      }
+       if (failed(IREE::Flow::hoistOutOfDispatch(rewriter, op))) {
+         op->emitOpError("failed to hoist the op out of dispatch");
+         return signalPassFailure();
+diff --git a/compiler/src/iree/compiler/DispatchCreation/Passes.cpp b/compiler/src/iree/compiler/DispatchCreation/Passes.cpp
+index d5c8395..de74804 100644
+--- a/compiler/src/iree/compiler/DispatchCreation/Passes.cpp
++++ b/compiler/src/iree/compiler/DispatchCreation/Passes.cpp
+@@ -50,6 +50,12 @@ static llvm::cl::opt<bool> clExperimentalMultiUseEncodingFusion(
+         "Enable encoding op fusion if the producer has more than one use"),
+     llvm::cl::init(false));
+ 
++static llvm::cl::opt<bool> clDisableCollapseDimensions(
++    "iree-dispatch-creation-disable-collapse-dimensions",
++    llvm::cl::desc("Disable collapsing dimensions of linalg ops (preserves "
++                   "spatial dims for tiling)"),
++    llvm::cl::init(false));
++
+ static llvm::cl::opt<DispatchCreation::EncodingOptions> clSetEncodingStrategy(
+     "iree-dispatch-creation-set-encoding-strategy",
+     llvm::cl::desc("Set the encoding strategy for operations."),
+@@ -244,8 +250,10 @@ static void addDispatchRegionCreationPasses(OpPassManager &passManager,
+             CloneProducersIntoDispatchRegionsPassOptions{
+                 options.enableAggressiveFusion});
+       })
+-      // Collapse dimensions of linalg Ops.
+-      .addPass(DispatchCreation::createCollapseDimensionsPass)
++      // Collapse dimensions of linalg Ops (skip if disabled for tiling
++      // preservation).
++      .addPredicatedPass(!clDisableCollapseDimensions,
++                         DispatchCreation::createCollapseDimensionsPass)
+       // Hoist scalar compute introduced from collapsing dimensions to
+       // increase CSE and deduplication opportunities.
+       .addPass(DispatchCreation::createHoistUniformScalarComputePass);
+diff --git a/compiler/src/iree/compiler/DispatchCreation/SetEncoding.cpp b/compiler/src/iree/compiler/DispatchCreation/SetEncoding.cpp
+index c3d1c45..6c1616f 100644
+--- a/compiler/src/iree/compiler/DispatchCreation/SetEncoding.cpp
++++ b/compiler/src/iree/compiler/DispatchCreation/SetEncoding.cpp
+@@ -14,6 +14,7 @@
+ #include "iree/compiler/Dialect/LinalgExt/Utils/MatchUtils.h"
+ #include "iree/compiler/DispatchCreation/FusionUtils.h"
+ #include "iree/compiler/DispatchCreation/Passes.h"
++#include "llvm/ADT/DenseSet.h"
+ #include "mlir/Dialect/Linalg/IR/Linalg.h"
+ #include "mlir/Dialect/Linalg/Utils/Utils.h"
+ #include "mlir/Dialect/MemRef/Transforms/Transforms.h"
+@@ -70,6 +71,149 @@ getDataTilingCandidates(FunctionOpInterface funcOp) {
+   return result;
+ }
+ 
++/// The activation of a convolution with its constant spatial padding stripped
++/// off, see `getUnpaddedConvActivation`.
++struct UnpaddedConvActivation {
++  Value source;
++  // Symmetric padding per spatial dim, [padH, padW].
++  SmallVector<int64_t> padding;
++  // Unpadded spatial sizes [H, W]; empty if either is dynamic.
++  SmallVector<int64_t> inputHW;
++  // Unpadded input channel count, if static.
++  std::optional<int64_t> inputC;
++};
++
++/// If the activation (DPS input 0) of convolution `linalgOp` is a tensor.pad
++/// with a constant value, static symmetric padding on the two spatial dims and
++/// no padding on any other dim, returns its unpadded source and the padding.
++/// Encoding the unpadded tensor keeps the activation layout identical to the
++/// producer's tiled output, and the target applies the padding as a halo.
++/// Only linalg.generic convs are handled, since their indexing maps are
++/// rewritten afterwards (see `stripKernelOffsetsFromActivationMap`).
++static std::optional<UnpaddedConvActivation>
++getUnpaddedConvActivation(linalg::LinalgOp linalgOp) {
++  if (!isa<linalg::GenericOp>(linalgOp.getOperation()) ||
++      !linalg::isaConvolutionOpInterface(linalgOp)) {
++    return std::nullopt;
++  }
++  auto padOp = linalgOp.getDpsInputs()[0].getDefiningOp<tensor::PadOp>();
++  if (!padOp || !padOp.getConstantPaddingValue()) {
++    return std::nullopt;
++  }
++  FailureOr<linalg::ConvolutionDimensions> convDims =
++      linalg::inferConvolutionDims(linalgOp);
++  if (failed(convDims) || convDims->outputImage.size() != 2) {
++    return std::nullopt;
++  }
++
++  // Spatial results of the activation map are the ones that use an output
++  // image loop dim; the channel result uses the input channel loop dim.
++  AffineMap inMap =
++      linalgOp.getMatchingIndexingMap(linalgOp.getDpsInputOperand(0));
++  SmallVector<int64_t> spatialPos(2, -1);
++  std::optional<int64_t> chanPos;
++  for (auto [pos, expr] : llvm::enumerate(inMap.getResults())) {
++    for (auto [k, dim] : llvm::enumerate(convDims->outputImage)) {
++      if (expr.isFunctionOfDim(dim)) {
++        spatialPos[k] = pos;
++      }
++    }
++    if (convDims->inputChannel.size() == 1 &&
++        expr.isFunctionOfDim(convDims->inputChannel[0])) {
++      chanPos = pos;
++    }
++  }
++  if (spatialPos[0] < 0 || spatialPos[1] < 0 ||
++      spatialPos[0] == spatialPos[1]) {
++    return std::nullopt;
++  }
++
++  ArrayRef<int64_t> lows = padOp.getStaticLow();
++  ArrayRef<int64_t> highs = padOp.getStaticHigh();
++  if (lows.size() != highs.size() ||
++      static_cast<int64_t>(lows.size()) != inMap.getNumResults()) {
++    return std::nullopt;
++  }
++  for (auto [pos, low, high] : llvm::enumerate(lows, highs)) {
++    if (ShapedType::isDynamic(low) || ShapedType::isDynamic(high)) {
++      return std::nullopt;
++    }
++    bool isSpatial = static_cast<int64_t>(pos) == spatialPos[0] ||
++                     static_cast<int64_t>(pos) == spatialPos[1];
++    if (isSpatial ? low != high : (low != 0 || high != 0)) {
++      return std::nullopt;
++    }
++  }
++
++  UnpaddedConvActivation result;
++  result.source = padOp.getSource();
++  result.padding = {lows[spatialPos[0]], lows[spatialPos[1]]};
++  auto srcType = cast<RankedTensorType>(result.source.getType());
++  if (!srcType.isDynamicDim(spatialPos[0]) &&
++      !srcType.isDynamicDim(spatialPos[1])) {
++    result.inputHW = {srcType.getDimSize(spatialPos[0]),
++                      srcType.getDimSize(spatialPos[1])};
++  }
++  if (chanPos && !srcType.isDynamicDim(*chanPos)) {
++    result.inputC = srcType.getDimSize(*chanPos);
++  }
++  return result;
++}
++
++/// Drops the kernel-offset summands (terms using only filter loop dims, e.g.
++/// the `d3` in `d0 * 2 + d3`) from the activation indexing map of conv
++/// `linalgOp`, so the map's extent matches an unpadded activation.
++static void stripKernelOffsetsFromActivationMap(RewriterBase &rewriter,
++                                                linalg::GenericOp genericOp) {
++  FailureOr<linalg::ConvolutionDimensions> convDims =
++      linalg::inferConvolutionDims(
++          cast<linalg::LinalgOp>(genericOp.getOperation()));
++  if (failed(convDims)) {
++    return;
++  }
++  llvm::SmallDenseSet<unsigned> filterDims(convDims->filterLoop.begin(),
++                                           convDims->filterLoop.end());
++  auto isKernelOnly = [&](AffineExpr expr) {
++    bool usesDim = false, onlyFilterDims = true;
++    expr.walk([&](AffineExpr sub) {
++      if (auto dim = dyn_cast<AffineDimExpr>(sub)) {
++        usesDim = true;
++        onlyFilterDims &= filterDims.contains(dim.getPosition());
++      }
++    });
++    return usesDim && onlyFilterDims;
++  };
++
++  SmallVector<AffineMap> maps = genericOp.getIndexingMapsArray();
++  SmallVector<AffineExpr> newResults;
++  for (AffineExpr expr : maps[0].getResults()) {
++    SmallVector<AffineExpr> summands;
++    SmallVector<AffineExpr> worklist = {expr};
++    while (!worklist.empty()) {
++      AffineExpr e = worklist.pop_back_val();
++      auto add = dyn_cast<AffineBinaryOpExpr>(e);
++      if (add && add.getKind() == AffineExprKind::Add) {
++        worklist.push_back(add.getRHS());
++        worklist.push_back(add.getLHS());
++        continue;
++      }
++      if (!isKernelOnly(e)) {
++        summands.push_back(e);
++      }
++    }
++    AffineExpr newExpr = rewriter.getAffineConstantExpr(0);
++    for (AffineExpr summand : summands) {
++      newExpr = newExpr + summand;
++    }
++    newResults.push_back(newExpr);
++  }
++  maps[0] = AffineMap::get(maps[0].getNumDims(), maps[0].getNumSymbols(),
++                           newResults, rewriter.getContext());
++  rewriter.modifyOpInPlace(genericOp, [&]() {
++    genericOp.setIndexingMapsAttr(rewriter.getAffineMapArrayAttr(maps));
++  });
++}
++
+ /// Set data tiling encodings using the SerializableAttr interface.
+ /// This uses SerializableAttr::getEncodingProperties() to derive encodings
+ /// for all operands and results based on the operation type.
+@@ -89,13 +233,24 @@ static LogicalResult setDataTilingEncodings(RewriterBase &rewriter,
+ 
+   IREE::Encoding::OpEncodingProperties encProps = *encodingResult;
+ 
+-  // Set encodings on input operands.
+-  SmallVector<Value> encodedInputOperands;
++  // For a convolution with a padded activation, encode the unpadded source;
++  // the padding is recorded on the op below.
++  std::optional<UnpaddedConvActivation> unpaddedActivation;
++  if (!encProps.operands.empty()) {
++    unpaddedActivation = getUnpaddedConvActivation(linalgOp);
++  }
++
++  // Set encodings on input operands. Inputs without encoding properties (e.g.
++  // the zero points of a quantized convolution) are passed through as-is;
++  // `encProps.operands` is ordered by DPS input position.
++  SmallVector<Value> encodedInputOperands = linalgOp.getDpsInputs();
+   for (auto [idx, props] : llvm::enumerate(encProps.operands)) {
+-    Value src = linalgOp.getDpsInputs()[idx];
+-    Value encoded =
++    Value src = encodedInputOperands[idx];
++    if (idx == 0 && unpaddedActivation) {
++      src = unpaddedActivation->source;
++    }
++    encodedInputOperands[idx] =
+         setEncoding(rewriter, loc, src, props.encoding, props.dynamicValues);
+-    encodedInputOperands.push_back(encoded);
+   }
+ 
+   // Set encoding on init operand.
+@@ -112,6 +267,23 @@ static LogicalResult setDataTilingEncodings(RewriterBase &rewriter,
+       clone(rewriter, linalgOp, encodedInitOperand.getType(), encodedOperands)
+           ->getResult(0);
+ 
++  if (unpaddedActivation) {
++    auto tiledOp = cast<linalg::GenericOp>(opTiled.getDefiningOp());
++    stripKernelOffsetsFromActivationMap(rewriter, tiledOp);
++    tiledOp->setAttr(
++        IREE::Encoding::kConvPaddingAttrName,
++        rewriter.getDenseI64ArrayAttr(unpaddedActivation->padding));
++    if (!unpaddedActivation->inputHW.empty()) {
++      tiledOp->setAttr(
++          IREE::Encoding::kConvInputHWAttrName,
++          rewriter.getDenseI64ArrayAttr(unpaddedActivation->inputHW));
++    }
++    if (unpaddedActivation->inputC) {
++      tiledOp->setAttr(IREE::Encoding::kConvInputCAttrName,
++                       rewriter.getI64IntegerAttr(*unpaddedActivation->inputC));
++    }
++  }
++
+   // Sizes are computed by original output size.
+   SmallVector<OpFoldResult> outSizes =
+       tensor::getMixedSizes(rewriter, loc, linalgOp.getDpsInits()[0]);
+-- 
+2.34.1
+

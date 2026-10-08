@@ -1,3 +1,4 @@
+#include "dummy/Encoding/LLEncodingExternalModels.h"
 #include "dummy/IR/LLDialect.h"
 #include "dummy/IR/LLOps.h"
 #include "dummy/Target/DummyTarget.h"
@@ -18,6 +19,7 @@ struct DummySession
 
   void onRegisterDialects(DialectRegistry& registry) override {
     registry.insert<Dummy::LL::LLDialect>();
+    Dummy::LL::registerLLEncodingExternalModels(registry);
   }
 
   void populateHALTargetDevices(

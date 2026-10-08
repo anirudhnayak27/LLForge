@@ -5,6 +5,9 @@
 
 namespace mlir::iree_compiler::Dummy::LL {
 
-void LLDialect::initialize() { initializeLLOps(); }
+void LLDialect::initialize() {
+  initializeLLAttrs();
+  initializeLLOps();
+}
 
 }  // namespace mlir::iree_compiler::Dummy::LL

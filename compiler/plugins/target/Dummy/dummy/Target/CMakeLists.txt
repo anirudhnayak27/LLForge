@@ -10,6 +10,7 @@ iree_cc_library(
     SRCS
         "DummyTarget.cpp"
     DEPS
+        iree::compiler::Dialect::Encoding::IR
         iree::compiler::Dialect::HAL::Target
         iree::target::dummy::IR::LLDialect
         iree::target::dummy::Transforms

@@ -1,7 +1,9 @@
 #include "dummy/Target/DummyTarget.h"
 
+#include "dummy/IR/LLAttrs.h"
 #include "dummy/IR/LLDialect.h"
 #include "dummy/Transforms/Passes.h"
+#include "iree/compiler/Dialect/Encoding/IR/EncodingTypes.h"
 #include "iree/compiler/Dialect/HAL/Target/TargetRegistry.h"
 #include "llvm/Support/Debug.h"
 #include "mlir/IR/Builders.h"
@@ -49,6 +51,10 @@ class DummyTargetBackend final : public IREE::HAL::TargetBackend {
       const override {
     Builder b(context);
     SmallVector<NamedAttribute> configItems;
+    // Resolves data-tiling encodings to the static packed layouts.
+    configItems.emplace_back(
+        b.getStringAttr(IREE::Encoding::kEncodingResolverAttrName),
+        LL::EncodingResolverAttr::get(context, {}));
     auto configAttr = b.getDictionaryAttr(configItems);
 
     executableTargetAttrs.push_back(IREE::HAL::ExecutableTargetAttr::get(

@@ -14,6 +14,16 @@ iree_tablegen_library(
 
 iree_tablegen_library(
     NAME
+        LLAttrsGenInc
+    TD_FILE
+        "LLAttrs.td"
+    OUTS
+        --gen-attrdef-decls --attrdefs-dialect=ll LLAttrs.h.inc
+        --gen-attrdef-defs --attrdefs-dialect=ll LLAttrs.cpp.inc
+)
+
+iree_tablegen_library(
+    NAME
         LLOpsGenInc
     TD_FILE
         "LLOps.td"
@@ -26,17 +36,22 @@ iree_cc_library(
     NAME
         LLDialect
     HDRS
+        "LLAttrs.h"
         "LLDialect.h"
         "LLOps.h"
     TEXTUAL_HDRS
+        "LLAttrs.h.inc"
+        "LLAttrs.cpp.inc"
         "LLDialect.h.inc"
         "LLDialect.cpp.inc"
         "LLOps.h.inc"
         "LLOps.cpp.inc"
     SRCS
+        "LLAttrs.cpp"
         "LLDialect.cpp"
         "LLOps.cpp"
     DEPS
+        ::LLAttrsGenInc
         ::LLDialectGenInc
         ::LLOpsGenInc
         MLIRIR

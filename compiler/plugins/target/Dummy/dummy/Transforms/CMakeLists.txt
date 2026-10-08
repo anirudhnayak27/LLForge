@@ -43,6 +43,8 @@ iree_cc_library(
     DEPS
         ::PassHeaders
         ::PassesGenInc
+        iree::compiler::Codegen::Common
+        iree::compiler::Utils
         iree::target::dummy::IR::LLDialect
         MLIRPass
         MLIRIR
